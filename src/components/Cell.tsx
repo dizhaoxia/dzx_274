@@ -1,5 +1,7 @@
-/** 单格：左键翻开、右键标旗/问号、双击 Chord、移动端长按标旗。 */
-import { Bomb, Flag, HelpCircle } from "lucide-react";
+/** 单格：左键翻开、右键标旗/问号、双击 Chord、移动端长按标旗。
+ * v2.0 新增：frozen 状态（游戏结束后禁止点击）、样式优化。
+ */
+import { Bomb, Flag, HelpCircle, Lock } from "lucide-react";
 import type { CellState } from "@shared/protocol";
 import { useGameStore } from "@/store/gameStore";
 import { cn } from "@/lib/utils";
@@ -25,6 +27,7 @@ interface CellProps {
   exploded: boolean;
   pending: boolean;
   disabled: boolean;
+  frozen: boolean;
   size: number;
 }
 
@@ -37,6 +40,7 @@ export function Cell({
   exploded,
   pending,
   disabled,
+  frozen,
   size,
 }: CellProps) {
   const reveal = useGameStore((s) => s.reveal);
@@ -67,7 +71,13 @@ export function Cell({
       type="button"
       aria-label={`cell ${row}-${col}`}
       style={{ width: size, height: size, fontSize: Math.round(size * 0.5) }}
-      className={cn(baseCls, visual, pending && "ring-1 ring-amber/50 animate-pulseGlow")}
+      className={cn(
+        baseCls, 
+        visual, 
+        pending && "ring-1 ring-amber/50 animate-pulseGlow",
+        frozen && !revealed && "opacity-80",
+        disabled && "cursor-not-allowed"
+      )}
       onClick={() => {
         if (disabled) return;
         if (!revealed) reveal(row, col);
@@ -92,7 +102,9 @@ export function Cell({
         e.currentTarget.addEventListener("pointerleave", cancel, { once: true });
       }}
     >
-      {mineVisible ? (
+      {frozen && !revealed && !mineVisible && state === "hidden" ? (
+        <Lock className="h-[35%] w-[35%] text-zinc-600" />
+      ) : mineVisible ? (
         <Bomb className="h-[55%] w-[55%]" />
       ) : revealed && adjacent > 0 ? (
         <span className={NUMBER_CLASS[adjacent] ?? "text-zinc-300"}>{adjacent}</span>

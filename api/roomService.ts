@@ -2,6 +2,14 @@
  * 房间与游戏的权威逻辑层。
  * 所有翻格/标旗/双击结果均由本模块基于 shared 算法计算，服务端为唯一权威。
  * 本模块不直接接触 Socket.IO，只返回结构化结果，由 realtime 层负责广播。
+ * 
+ * v2.0 新增：
+ * - 原子操作队列 + 版本号递增
+ * - 批量操作拆解为原子指令序列
+ * - 胜利/失败冻结机制
+ * - 暂停/继续功能
+ * - 同种子复盘 / 新种子重开
+ * - 增量状态计算
  */
 import { randomBytes } from "crypto";
 import {
@@ -9,9 +17,12 @@ import {
   cellIndex,
 } from "@shared/protocol";
 import type {
+  AtomicCellOp,
+  AtomicOpResult,
   CellOpResult,
   CellState,
   GameConfig,
+  IncrementalState,
   RevealedCell,
   RoomSnapshot,
 } from "@shared/protocol";
@@ -37,6 +48,10 @@ export interface CellOpOutcome {
   cells: RevealedCell[];
   result?: CellOpResult;
   started?: boolean;
+  version: number;
+  atomicResults?: AtomicOpResult[];
+  rollbackRequired: boolean;
+  currentCellState?: CellState;
 }
 
 export function snapshot(room: ServerRoom): RoomSnapshot {
@@ -54,6 +69,9 @@ export function snapshot(room: ServerRoom): RoomSnapshot {
     difficulty: room.difficulty,
     config: room.config,
     gameStartTimestamp: room.gameStartTimestamp,
+    pausedAt: room.pausedAt,
+    pausedElapsed: room.pausedElapsed,
+    globalVersion: room.globalVersion,
   };
 }
 
@@ -71,6 +89,9 @@ export function createRoom(
     difficulty,
     revealed: new Set(),
     flags: new Map(),
+    globalVersion: 0,
+    stateHistory: [],
+    frozen: false,
   };
   room.players.set(hostId, { id: hostId, name, ready: false, isHost: true });
   roomStore.set(room);
@@ -142,6 +163,77 @@ export function startGame(room: ServerRoom, playerId: string): GameConfig {
   room.flags = new Map();
   room.status = "playing";
   room.gameStartTimestamp = undefined;
+  room.globalVersion = 0;
+  room.stateHistory = [];
+  room.frozen = false;
+  room.pausedAt = undefined;
+  room.pausedElapsed = undefined;
+  room.explodedCell = undefined;
+  return config;
+}
+
+export function pauseGame(room: ServerRoom, playerId: string): { pausedAt: number; pausedElapsed: number } {
+  if (room.hostId !== playerId) throw new ServiceError("NOT_HOST", "仅房主可暂停游戏");
+  if (room.status !== "playing") throw new ServiceError("NOT_PLAYING", "游戏未在进行中");
+  const now = Date.now();
+  room.status = "paused";
+  room.pausedAt = now;
+  room.pausedElapsed = room.gameStartTimestamp ? now - room.gameStartTimestamp : 0;
+  return { pausedAt: now, pausedElapsed: room.pausedElapsed };
+}
+
+export function resumeGame(room: ServerRoom, playerId: string): number {
+  if (room.hostId !== playerId) throw new ServiceError("NOT_HOST", "仅房主可继续游戏");
+  if (room.status !== "paused") throw new ServiceError("NOT_PAUSED", "游戏未暂停");
+  const now = Date.now();
+  if (room.gameStartTimestamp && room.pausedAt) {
+    const pausedDuration = now - room.pausedAt;
+    room.gameStartTimestamp += pausedDuration;
+  }
+  room.status = "playing";
+  room.pausedAt = undefined;
+  room.pausedElapsed = undefined;
+  return now;
+}
+
+export function restartGame(
+  room: ServerRoom,
+  playerId: string,
+  reuseSeed: boolean,
+  newSeed?: string,
+): GameConfig {
+  if (room.hostId !== playerId) throw new ServiceError("NOT_HOST", "仅房主可重新开始");
+  if (!room.config) throw new ServiceError("NO_CONFIG", "没有可重开的游戏");
+  
+  const preset = DIFFICULTY_PRESETS[room.difficulty];
+  let seed: string;
+  if (reuseSeed) {
+    seed = room.config.seed;
+  } else if (newSeed && newSeed.trim()) {
+    seed = newSeed.trim();
+  } else {
+    seed = `${Date.now()}-${randomBytes(4).toString("hex")}`;
+  }
+  
+  const config: GameConfig = {
+    seed,
+    rows: preset.rows,
+    cols: preset.cols,
+    mineCount: preset.mineCount,
+    mineHash: buildMineHash({ ...preset, seed }),
+  };
+  room.config = config;
+  room.mines = generateMineSet({ ...preset, seed });
+  room.revealed = new Set();
+  room.flags = new Map();
+  room.status = "playing";
+  room.gameStartTimestamp = undefined;
+  room.globalVersion = 0;
+  room.stateHistory = [];
+  room.frozen = false;
+  room.pausedAt = undefined;
+  room.pausedElapsed = undefined;
+  room.explodedCell = undefined;
   return config;
 }
 
@@ -153,10 +245,19 @@ export function resetGame(room: ServerRoom, playerId: string): void {
   room.flags = new Map();
   room.status = "waiting";
   room.gameStartTimestamp = undefined;
+  room.globalVersion = 0;
+  room.stateHistory = [];
+  room.frozen = false;
+  room.pausedAt = undefined;
+  room.pausedElapsed = undefined;
+  room.explodedCell = undefined;
   for (const p of room.players.values()) p.ready = false;
 }
 
 function ensurePlaying(room: ServerRoom): { rows: number; cols: number } {
+  if (room.frozen) {
+    throw new ServiceError("GAME_FROZEN", "游戏已结束，无法操作");
+  }
   if (room.status !== "playing" || !room.mines || !room.config) {
     throw new ServiceError("NOT_PLAYING", "游戏未在进行中");
   }
@@ -169,59 +270,86 @@ function checkWin(room: ServerRoom): boolean {
   return room.revealed.size === total - room.mines.size;
 }
 
-export function revealCell(room: ServerRoom, row: number, col: number): CellOpOutcome {
+export function getCurrentCellState(room: ServerRoom, row: number, col: number): CellState {
+  const cols = room.config?.cols ?? 0;
+  const idx = cellIndex(row, col, cols);
+  if (room.revealed.has(idx)) return "revealed";
+  return room.flags.get(idx) ?? "hidden";
+}
+
+function executeAtomicOp(
+  room: ServerRoom,
+  op: AtomicCellOp
+): AtomicOpResult {
   const { rows, cols } = ensurePlaying(room);
   const mines = room.mines!;
-  const idx = cellIndex(row, col, cols);
-
-  if (room.revealed.has(idx)) return { state: "revealed", cells: [], result: "clear" };
-  if (room.flags.get(idx) === "flagged") return { state: "flagged", cells: [], result: "clear" };
-
-  const started = room.gameStartTimestamp === undefined;
-  if (started) room.gameStartTimestamp = Date.now();
-
-  if (isMine(mines, row, col, cols)) {
-    const cells = allMines(mines, cols);
-    cells.forEach((c) => room.revealed.add(cellIndex(c.row, c.col, cols)));
-    room.status = "ended";
-    return { state: "revealed", cells, result: "boom", started };
-  }
-
-  const region = floodReveal(mines, rows, cols, row, col);
-  const newly: RevealedCell[] = [];
-  for (const c of region) {
-    const ci = cellIndex(c.row, c.col, cols);
-    if (!room.revealed.has(ci)) {
-      room.revealed.add(ci);
-      newly.push(c);
+  
+  if (op.type === "reveal") {
+    const idx = cellIndex(op.row, op.col, cols);
+    
+    if (room.revealed.has(idx)) {
+      return { op, success: false, state: "revealed", cells: [] };
     }
+    if (room.flags.get(idx) === "flagged") {
+      return { op, success: false, state: "flagged", cells: [] };
+    }
+
+    if (isMine(mines, op.row, op.col, cols)) {
+      const cells = allMines(mines, cols);
+      cells.forEach((c) => room.revealed.add(cellIndex(c.row, c.col, cols)));
+      room.frozen = true;
+      room.explodedCell = idx;
+      return { op, success: true, state: "revealed", cells, result: "boom" };
+    }
+
+    const region = floodReveal(mines, rows, cols, op.row, op.col);
+    const newly: RevealedCell[] = [];
+    for (const c of region) {
+      const ci = cellIndex(c.row, c.col, cols);
+      if (!room.revealed.has(ci)) {
+        room.revealed.add(ci);
+        newly.push(c);
+      }
+    }
+    
+    const win = checkWin(room);
+    if (win) room.frozen = true;
+    
+    return { 
+      op, 
+      success: true, 
+      state: "revealed", 
+      cells: newly, 
+      result: win ? "win" : "clear" 
+    };
+  } else {
+    const idx = cellIndex(op.row, op.col, cols);
+    if (room.revealed.has(idx)) {
+      return { op, success: false, state: "revealed", cells: [] };
+    }
+    if (op.state === "hidden") room.flags.delete(idx);
+    else room.flags.set(idx, op.state);
+    
+    return { op, success: true, state: op.state, cells: [] };
   }
-  const result: CellOpResult = checkWin(room) ? "win" : "clear";
-  if (result === "win") room.status = "ended";
-  return { state: "revealed", cells: newly, result, started };
 }
 
-export function flagCell(room: ServerRoom, row: number, col: number): CellOpOutcome {
-  ensurePlaying(room);
-  const cols = room.config!.cols;
-  const idx = cellIndex(row, col, cols);
-  if (room.revealed.has(idx)) return { state: "revealed", cells: [], result: "clear" };
-  const cur = room.flags.get(idx) ?? "hidden";
-  const next: CellState = cur === "hidden" ? "flagged" : cur === "flagged" ? "question" : "hidden";
-  if (next === "hidden") room.flags.delete(idx);
-  else room.flags.set(idx, next);
-  return { state: next, cells: [], result: "clear" };
-}
-
-export function chordCell(room: ServerRoom, row: number, col: number): CellOpOutcome {
+export function decomposeChord(
+  room: ServerRoom,
+  row: number,
+  col: number
+): AtomicCellOp[] {
   const { rows, cols } = ensurePlaying(room);
   const mines = room.mines!;
   const idx = cellIndex(row, col, cols);
-  if (!room.revealed.has(idx)) return { state: "hidden", cells: [], result: "clear" };
-
+  
+  const ops: AtomicCellOp[] = [];
+  
+  if (!room.revealed.has(idx)) return ops;
+  
   const num = adjacentMines(mines, row, col, rows, cols);
-  if (num === 0) return { state: "revealed", cells: [], result: "clear" };
-
+  if (num === 0) return ops;
+  
   let flagCount = 0;
   for (let dr = -1; dr <= 1; dr++) {
     for (let dc = -1; dc <= 1; dc++) {
@@ -232,10 +360,9 @@ export function chordCell(room: ServerRoom, row: number, col: number): CellOpOut
       if (room.flags.get(cellIndex(r, c, cols)) === "flagged") flagCount++;
     }
   }
-  if (flagCount !== num) return { state: "revealed", cells: [], result: "clear" };
-
-  const newly: RevealedCell[] = [];
-  let boom = false;
+  
+  if (flagCount !== num) return ops;
+  
   for (let dr = -1; dr <= 1; dr++) {
     for (let dc = -1; dc <= 1; dc++) {
       if (dr === 0 && dc === 0) continue;
@@ -245,30 +372,199 @@ export function chordCell(room: ServerRoom, row: number, col: number): CellOpOut
       const ni = cellIndex(r, c, cols);
       if (room.flags.get(ni) === "flagged") continue;
       if (room.revealed.has(ni)) continue;
-      if (isMine(mines, r, c, cols)) {
-        boom = true;
-        break;
-      }
-      const region = floodReveal(mines, rows, cols, r, c);
-      for (const cell of region) {
-        const ci = cellIndex(cell.row, cell.col, cols);
-        if (!room.revealed.has(ci)) {
-          room.revealed.add(ci);
-          newly.push(cell);
-        }
-      }
+      ops.push({ type: "reveal", row: r, col: c });
     }
   }
+  
+  return ops;
+}
 
-  if (boom) {
-    const cells = allMines(mines, cols);
-    cells.forEach((mc) => room.revealed.add(cellIndex(mc.row, mc.col, cols)));
-    room.status = "ended";
-    return { state: "revealed", cells, result: "boom" };
+export function executeAtomicSequence(
+  room: ServerRoom,
+  ops: AtomicCellOp[]
+): { results: AtomicOpResult[]; finalResult?: CellOpResult; started: boolean; allCells: RevealedCell[] } {
+  const started = room.gameStartTimestamp === undefined;
+  if (started) room.gameStartTimestamp = Date.now();
+
+  const results: AtomicOpResult[] = [];
+  let finalResult: CellOpResult = "clear";
+  const allCells: RevealedCell[] = [];
+  const seen = new Set<number>();
+  
+  for (const op of ops) {
+    const result = executeAtomicOp(room, op);
+    results.push(result);
+    
+    for (const cell of result.cells) {
+      const idx = cellIndex(cell.row, cell.col, room.config!.cols);
+      if (!seen.has(idx)) {
+        seen.add(idx);
+        allCells.push(cell);
+      }
+    }
+    
+    if (result.result === "boom" || result.result === "win") {
+      finalResult = result.result;
+      break;
+    }
   }
-  const result: CellOpResult = checkWin(room) ? "win" : "clear";
-  if (result === "win") room.status = "ended";
-  return { state: "revealed", cells: newly, result };
+  
+  if (finalResult === "clear" && checkWin(room)) {
+    finalResult = "win";
+    room.frozen = true;
+  }
+  
+  if (finalResult === "boom") {
+    room.status = "ended";
+  } else if (finalResult === "win") {
+    room.status = "ended";
+  }
+  
+  return { results, finalResult, started, allCells };
+}
+
+export function revealCell(room: ServerRoom, row: number, col: number, clientVersion: number): CellOpOutcome {
+  const currentState = getCurrentCellState(room, row, col);
+  
+  if (room.revealed.has(cellIndex(row, col, room.config!.cols)) || 
+      room.flags.get(cellIndex(row, col, room.config!.cols)) === "flagged") {
+    return {
+      state: currentState,
+      cells: [],
+      result: "clear",
+      version: room.globalVersion,
+      atomicResults: [],
+      rollbackRequired: clientVersion !== room.globalVersion,
+      currentCellState: currentState,
+    };
+  }
+  
+  const ops: AtomicCellOp[] = [{ type: "reveal", row, col }];
+  const { results, finalResult, started, allCells } = executeAtomicSequence(room, ops);
+  
+  const revealedForHistory: RevealedCell[] = [];
+  const flagsForHistory: Array<{ row: number; col: number; state: CellState }> = [];
+  
+  for (const r of results) {
+    if (r.op.type === "reveal" && r.success) {
+      revealedForHistory.push(...r.cells);
+    }
+  }
+  
+  const explodedCell = finalResult === "boom" ? { row, col } : null;
+  const status = finalResult === "boom" || finalResult === "win" ? "ended" : undefined;
+  
+  roomStore.appendHistory(room, revealedForHistory, flagsForHistory, status, explodedCell);
+  
+  return {
+    state: "revealed",
+    cells: allCells,
+    result: finalResult,
+    started,
+    version: room.globalVersion,
+    atomicResults: results,
+    rollbackRequired: clientVersion !== room.globalVersion,
+    currentCellState: currentState,
+  };
+}
+
+export function flagCell(room: ServerRoom, row: number, col: number, clientVersion: number): CellOpOutcome {
+  const currentState = getCurrentCellState(room, row, col);
+  
+  if (room.revealed.has(cellIndex(row, col, room.config!.cols))) {
+    return {
+      state: "revealed",
+      cells: [],
+      result: "clear",
+      version: room.globalVersion,
+      atomicResults: [],
+      rollbackRequired: clientVersion !== room.globalVersion,
+      currentCellState: currentState,
+    };
+  }
+  
+  const cur = room.flags.get(cellIndex(row, col, room.config!.cols)) ?? "hidden";
+  const next: CellState = cur === "hidden" ? "flagged" : cur === "flagged" ? "question" : "hidden";
+  
+  const ops: AtomicCellOp[] = [{ type: "flag", row, col, state: next }];
+  const { results, started, allCells } = executeAtomicSequence(room, ops);
+  
+  const revealedForHistory: RevealedCell[] = [];
+  const flagsForHistory: Array<{ row: number; col: number; state: CellState }> = [];
+  
+  for (const r of results) {
+    if (r.op.type === "flag" && r.success) {
+      flagsForHistory.push({ row, col, state: r.state });
+    }
+  }
+  
+  roomStore.appendHistory(room, revealedForHistory, flagsForHistory);
+  
+  return {
+    state: next,
+    cells: allCells,
+    result: "clear",
+    started,
+    version: room.globalVersion,
+    atomicResults: results,
+    rollbackRequired: clientVersion !== room.globalVersion,
+    currentCellState: currentState,
+  };
+}
+
+export function chordCell(room: ServerRoom, row: number, col: number, clientVersion: number): CellOpOutcome {
+  const currentState = getCurrentCellState(room, row, col);
+  
+  const ops = decomposeChord(room, row, col);
+  
+  if (ops.length === 0) {
+    return {
+      state: currentState,
+      cells: [],
+      result: "clear",
+      version: room.globalVersion,
+      atomicResults: [],
+      rollbackRequired: clientVersion !== room.globalVersion,
+      currentCellState: currentState,
+    };
+  }
+  
+  const { results, finalResult, started, allCells } = executeAtomicSequence(room, ops);
+  
+  const revealedForHistory: RevealedCell[] = [];
+  const flagsForHistory: Array<{ row: number; col: number; state: CellState }> = [];
+  
+  for (const r of results) {
+    if (r.op.type === "reveal" && r.success) {
+      revealedForHistory.push(...r.cells);
+    }
+  }
+  
+  let explodedCell = null;
+  if (finalResult === "boom") {
+    const boomResult = results.find((r) => r.result === "boom");
+    if (boomResult && boomResult.op.type === "reveal") {
+      explodedCell = { row: boomResult.op.row, col: boomResult.op.col };
+    }
+  }
+  const status = finalResult === "boom" || finalResult === "win" ? "ended" : undefined;
+  
+  roomStore.appendHistory(room, revealedForHistory, flagsForHistory, status, explodedCell);
+  
+  return {
+    state: "revealed",
+    cells: allCells,
+    result: finalResult,
+    started,
+    version: room.globalVersion,
+    atomicResults: results,
+    rollbackRequired: clientVersion !== room.globalVersion,
+    currentCellState: currentState,
+  };
+}
+
+export function getIncrementalState(room: ServerRoom, fromVersion: number): IncrementalState | null {
+  return roomStore.getDeltaSince(room, fromVersion);
 }
 
 export function findRoomByPlayer(playerId: string): ServerRoom | undefined {

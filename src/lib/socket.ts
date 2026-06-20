@@ -10,7 +10,7 @@ import {
 import type { ClientMessage, ServerMessage } from "@shared/protocol";
 
 /** 分布式 Omit：对判别联合体逐成员剔除字段，保留各变体独有字段。 */
-type DistributiveOmit<T, K extends keyof any> = T extends unknown ? Omit<T, K> : never;
+type DistributiveOmit<T, K extends string | number | symbol> = T extends unknown ? Omit<T, K> : never;
 
 const DEV_URL = "http://localhost:54343";
 const SOCKET_URL: string =

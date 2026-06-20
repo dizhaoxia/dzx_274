@@ -20,7 +20,7 @@ export function WaitingRoom() {
   const me = room.players.find((p) => p.id === myId);
   const isHost = me?.isHost ?? false;
   const myReady = me?.ready ?? false;
-  const allReady = room.players.every((p) => p.ready || p.isHost);
+  const allReady = room.players.length >= 2 && room.players.every((p) => p.ready || p.isHost);
 
   const handleLeave = (): void => {
     leaveRoom();
@@ -63,14 +63,14 @@ export function WaitingRoom() {
           <button type="button" className="tac-btn text-danger" onClick={handleLeave}>
             <LogOut className="h-4 w-4" /> 离开房间
           </button>
-          {!allReady && room.players.length > 1 && (
+          {!allReady && room.players.length >= 2 && (
             <p className="text-center font-mono text-[11px] text-zinc-500">
               等待全员准备…
             </p>
           )}
-          {room.players.length === 1 && (
-            <p className="text-center font-mono text-[11px] text-zinc-500">
-              单人模式 · 可直接开始
+          {room.players.length < 2 && (
+            <p className="text-center font-mono text-[11px] text-amber">
+              至少需要 2 名玩家
             </p>
           )}
         </div>
