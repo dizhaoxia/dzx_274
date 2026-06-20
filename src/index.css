@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: "Chakra Petch", system-ui, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: #0a0a0b;
+  color: #e4e4e7;
+  overflow: hidden;
+}
+
+@layer components {
+  .panel {
+    @apply border border-ink-700 bg-ink-900/80 backdrop-blur-sm;
+  }
+  .tac-btn {
+    @apply inline-flex items-center justify-center gap-2 border border-ink-600 bg-ink-800 px-4 py-2 font-display text-sm font-medium tracking-wide text-zinc-200 transition-all duration-150 hover:border-amber hover:text-amber hover:shadow-glow-amber disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-ink-600 disabled:hover:text-zinc-200 disabled:hover:shadow-none;
+  }
+  .tac-btn-primary {
+    @apply border-amber/60 bg-amber/10 text-amber hover:shadow-glow-amber;
+  }
+  .tac-btn-success {
+    @apply border-emerald/60 bg-emerald/10 text-emerald hover:shadow-glow-emerald;
+  }
+  .tac-chip {
+    @apply inline-flex items-center gap-1 border border-ink-600 bg-ink-800/60 px-2 py-0.5 font-mono text-[11px] uppercase tracking-widest text-zinc-400;
+  }
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 0;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: #f59e0b;
+}
